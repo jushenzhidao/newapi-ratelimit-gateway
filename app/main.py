@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from app.config import config
 from app.ratelimit import rate_limiter
+from app.resolver import resolver
 from app.sync import syncer
 from app.proxy import handle_proxy
 from app.admin import router as admin_router
@@ -33,8 +34,9 @@ db_session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动
-    await rate_limiter.init()
+    await rate_limiter.init(resolver=resolver)
     await syncer.init(rate_limiter._redis)
+    await resolver.init(rate_limiter._redis, db_session_factory, syncer._newapi_engine)
     await syncer.sync_once()
     await syncer.sync_group_configs(db_session_factory)
     sync_task = asyncio.create_task(syncer.run_loop(db_session_factory))
@@ -46,6 +48,7 @@ async def lifespan(app: FastAPI):
         await sync_task
     except asyncio.CancelledError:
         pass
+    await resolver.close()
     await syncer.close()
     await rate_limiter.close()
     await db_engine.dispose()
@@ -76,6 +79,8 @@ async def health():
         "degrade_mode": config.ratelimit.on_redis_error,
     }
     body.update(rate_limiter.stats())
+    body.update(rate_limiter.diagnostics())
+    body.update({f"resolver_{k}": v for k, v in resolver.stats().items()})
     return body
 
 

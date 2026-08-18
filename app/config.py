@@ -90,6 +90,20 @@ class RateLimitConfig(BaseSettings):
     # local_fallback 兜底参数：窗口秒数 + 单 key 最大请求数（每个 worker 独立计数，宜保守）
     fallback_window: int = 60
     fallback_max_requests: int = 60
+    # 分组感知兜底：Redis 故障且已解析出分组策略时，按「5h 限额 ÷ 该除数」
+    # 执行本地滑动窗口。0 = 自动使用 SERVER_WORKERS。
+    fallback_limit_divisor: int = 0
+    # 熔断器：Redis 连续失败达阈值后跳过 Redis 调用直接降级，避免逐请求等待超时
+    circuit_breaker_enabled: bool = True
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_open_seconds: float = 10.0
+    # L1 进程内缓存（keymap/config，Redis → MySQL 读透前的第一级）
+    local_cache_size: int = 50000
+    local_cache_ttl: int = 60
+    local_cache_negative_ttl: int = 10
+    # 请求数模式批量配额：一次 EVALSHA 预取 N 个配额本地消耗，Redis QPS 降为 1/N。
+    # 多 worker 并发预取的超发上界约为 (workers-1) * batch_size。
+    quota_batch_size: int = 10
     show_remaining: bool = True
     # token 模式 + 流式请求时，自动注入 stream_options.include_usage=true
     # 设为 false 如果上游 LLM 不支持此参数

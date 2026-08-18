@@ -47,11 +47,29 @@ cp .env.example .env && docker compose up -d
 | `SERVER_WORKERS` | uvicorn worker 数 |
 | `ADMIN_AUTH_TOKEN` | 管理 API 认证 token（生产必须强随机值） |
 | `RATELIMIT_ON_REDIS_ERROR` | Redis 故障降级策略：`passthrough` / `reject` / `local_fallback`（默认） |
-| `RATELIMIT_FALLBACK_WINDOW` / `RATELIMIT_FALLBACK_MAX_REQUESTS` | local_fallback 兜底窗口秒数 / 单 key 最大请求数 |
+| `RATELIMIT_FALLBACK_LIMIT_DIVISOR` | 分组感知兜底除数（0 = 自动用 `SERVER_WORKERS`） |
+| `RATELIMIT_CIRCUIT_BREAKER_*` | 熔断器：开关 / 失败阈值（默认 5）/ 打开秒数（默认 10） |
+| `RATELIMIT_LOCAL_CACHE_*` | L1 进程内缓存：容量（默认 5 万）/ TTL（默认 60s）/ 负缓存 TTL |
+| `RATELIMIT_QUOTA_BATCH_SIZE` | 批量配额预取大小（默认 10，Redis QPS 降为 1/N） |
 
 > `.env` 含真实凭据，已被 `.gitignore` 排除，请勿提交。
 
-## Redis 故障降级
+## 高可用架构
+
+限速链路按四层可靠性设计：
+
+```
+请求 → [熔断器] → [L1 缓存 → Redis → MySQL 读透]  (keymap/config 解析)
+     → [批量配额预取: 一次 EVALSHA 取 N 个配额本地消耗]  (请求数计数)
+     → [进程内滑动窗口兜底]  (Redis 故障期间)
+```
+
+- **三级解析**：key→分组、分组→策略 的查找走 L1 进程内缓存（LRU+TTL）→ Redis → MySQL 读透（读透结果写回 Redis）。Redis 挂掉时分组判断依然准确；负缓存防止恶意 key 穿透到数据库。
+- **熔断器**：Redis 连续失败 5 次后熔断打开，请求立即走降级路径，**不再逐请求等待 Redis 超时**（避免延迟雪崩与连接池耗尽）；10 秒后半开探测，恢复自动闭合。`/health` 的 ping 会反哺熔断状态。
+- **批量配额预取**（请求数模式）：每 worker 一次 EVALSHA 预取 `RATELIMIT_QUOTA_BATCH_SIZE` 个配额本地消耗（flush + 检查 + 预取单次往返完成）。Redis QPS 降为 1/N，且短暂抖动期间（N 个请求内）限速完全不感知。多 worker 并发预取的超发上界约 `(workers-1) × batch_size`，长窗口（5h/7d/30d）场景可接受。
+- **分组感知兜底**：`local_fallback` 模式下，已解析出分组策略的 key 按「5h 限额 ÷ worker 数」执行本地滑动窗口（默认除数 = `SERVER_WORKERS`，可用 `RATELIMIT_FALLBACK_LIMIT_DIVISOR` 覆盖）；解析不到策略时退回全局兜底参数。
+
+### Redis 故障降级
 
 Redis 是限速的唯一后端，故障时的行为由 `RATELIMIT_ON_REDIS_ERROR` 控制：
 
@@ -64,9 +82,15 @@ Redis 是限速的唯一后端，故障时的行为由 `RATELIMIT_ON_REDIS_ERROR
 其他保障：
 
 - **NOSCRIPT 自愈**：Redis 重启后 Lua 脚本缓存丢失，网关自动重新 `SCRIPT LOAD` 并重试，限速自动恢复，无需重启网关。
-- **`/health` 可观测**：返回 `status`（ok/degraded）、`redis`（up/down）与降级累计计数（`redis_error_total`、`fallback_reject_total` 等）。Redis down 时仍返回 200，避免被负载均衡摘除；告警请按 `status == "degraded"` 触发。
-- **恢复自愈**：keymap / 分组配置由 MySQL 定时同步自动回填；计数器丢失会重置（Redis 开 AOF `appendonly yes` 可把丢失窗口压到 1 秒）。
-- `local_fallback` 为每个 worker 独立计数（多 worker 下实际阈值为 `N × max_requests`），请保守设置。
+- **`/health` 可观测**：返回 `status`（ok/degraded）、`redis`（up/down）、降级累计计数、熔断器状态（`circuit.state`）与三级解析统计（`resolver_*`）。Redis down 时仍返回 200，避免被负载均衡摘除；告警请按 `status == "degraded"` 或 `circuit.state != "closed"` 触发。
+- **恢复自愈**：keymap / 分组配置由 MySQL 定时同步自动回填（读透路径也会即时写回）；计数器丢失会重置（Redis 开 AOF `appendonly yes` 可把丢失窗口压到 1 秒）。
+- 全局兜底参数（`RATELIMIT_FALLBACK_WINDOW` / `RATELIMIT_FALLBACK_MAX_REQUESTS`）仅在解析不到分组策略时使用；每个 worker 独立计数，请保守设置。
+
+## 冒烟测试
+
+```bash
+uv run python scripts/smoke_ha.py   # 熔断/L1/读透/批量配额/兜底 六组断言
+```
 
 ## CI / 镜像发布
 
