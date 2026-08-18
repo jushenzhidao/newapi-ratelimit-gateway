@@ -15,5 +15,5 @@ COPY . .
 
 EXPOSE 8080
 
-# 启动（--no-sync 复用构建期已同步的 .venv）
-CMD ["uv", "run", "--no-sync", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "4"]
+# 启动（--no-sync 复用构建期已同步的 .venv；host/port/workers 由环境变量控制）
+CMD ["sh", "-c", "exec uv run --no-sync uvicorn app.main:app --host ${SERVER_HOST:-0.0.0.0} --port ${SERVER_PORT:-8080} --workers ${SERVER_WORKERS:-4}"]

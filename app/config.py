@@ -1,23 +1,39 @@
-"""配置管理 - 从 config.yaml 加载"""
+"""配置管理 - 通过 .env 文件 / 环境变量加载
 
-from pathlib import Path
-from pydantic_settings import BaseSettings
-import yaml
-from typing import Optional
+变量命名规则：{前缀}_{字段名大写}，如 REDIS_HOST、MYSQL_PASSWORD、ADMIN_AUTH_TOKEN。
+优先级：进程环境变量 > .env 文件 > 代码默认值。
+Redis / MySQL 均为外部服务，本项目不自带部署。
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_ENV_FILE = dict(
+    env_file=".env",
+    env_file_encoding="utf-8",
+    extra="ignore",  # 忽略 .env 中不属于本配置段的变量
+)
 
 
 class ServerConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="SERVER_", **_ENV_FILE)
+
     host: str = "0.0.0.0"
     port: int = 8080
     workers: int = 4
 
 
 class NewAPIConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="NEWAPI_", **_ENV_FILE)
+
     base_url: str = "http://127.0.0.1:3000"
     timeout: int = 300
 
 
 class RedisConfig(BaseSettings):
+    """外部 Redis 服务连接配置"""
+
+    model_config = SettingsConfigDict(env_prefix="REDIS_", **_ENV_FILE)
+
     host: str = "127.0.0.1"
     port: int = 6379
     password: str = ""
@@ -26,6 +42,10 @@ class RedisConfig(BaseSettings):
 
 
 class MySQLConfig(BaseSettings):
+    """外部 MySQL（网关自身配置库）连接配置"""
+
+    model_config = SettingsConfigDict(env_prefix="MYSQL_", **_ENV_FILE)
+
     host: str = "127.0.0.1"
     port: int = 3306
     user: str = "root"
@@ -35,6 +55,10 @@ class MySQLConfig(BaseSettings):
 
 
 class NewAPIMySQLConfig(BaseSettings):
+    """NewAPI 数据库（只读，用于同步 Key->Group 映射）"""
+
+    model_config = SettingsConfigDict(env_prefix="NEWAPI_MYSQL_", **_ENV_FILE)
+
     host: str = "127.0.0.1"
     port: int = 3306
     user: str = "readonly_user"
@@ -44,12 +68,16 @@ class NewAPIMySQLConfig(BaseSettings):
 
 
 class SyncConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="SYNC_", **_ENV_FILE)
+
     key_group_interval: int = 60
     config_cache_ttl: int = 60
     key_map_ttl: int = 300
 
 
 class RateLimitConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="RATELIMIT_", **_ENV_FILE)
+
     on_key_not_found: str = "passthrough"
     on_config_not_found: str = "passthrough"
     show_remaining: bool = True
@@ -59,6 +87,8 @@ class RateLimitConfig(BaseSettings):
 
 
 class AdminConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="ADMIN_", **_ENV_FILE)
+
     enabled: bool = True
     auth_token: str = "change-me-in-production"
 
@@ -67,21 +97,14 @@ class AppConfig:
     """全局配置单例"""
 
     def __init__(self):
-        config_path = Path(__file__).parent.parent / "config.yaml"
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-        else:
-            data = {}
-
-        self.server = ServerConfig(**data.get("server", {}))
-        self.newapi = NewAPIConfig(**data.get("newapi", {}))
-        self.redis = RedisConfig(**data.get("redis", {}))
-        self.mysql = MySQLConfig(**data.get("mysql", {}))
-        self.newapi_mysql = NewAPIMySQLConfig(**data.get("newapi_mysql", {}))
-        self.sync = SyncConfig(**data.get("sync", {}))
-        self.ratelimit = RateLimitConfig(**data.get("ratelimit", {}))
-        self.admin = AdminConfig(**data.get("admin", {}))
+        self.server = ServerConfig()
+        self.newapi = NewAPIConfig()
+        self.redis = RedisConfig()
+        self.mysql = MySQLConfig()
+        self.newapi_mysql = NewAPIMySQLConfig()
+        self.sync = SyncConfig()
+        self.ratelimit = RateLimitConfig()
+        self.admin = AdminConfig()
 
     @property
     def redis_url(self) -> str:

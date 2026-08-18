@@ -17,32 +17,37 @@ NewAPI 无侵入式限速网关：客户端 → 本网关 → NewAPI → 上游 
 
 ```bash
 uv sync
-cp config.example.yaml config.yaml   # 按实际环境修改配置
+cp .env.example .env   # 按实际环境修改配置
 uv run uvicorn app.main:app --port 8080
 ```
 
-依赖：Redis、MySQL（执行 `sql/init.sql` 初始化）。
+依赖：**外部** Redis 与 MySQL（本项目不自带部署，需自行准备；MySQL 执行 `sql/init.sql` 初始化）。
 
 ### Docker 部署
 
 ```bash
 docker pull <dockerhub_username>/newapi-ratelimit-gateway:latest
 
-# 或从源码构建
-docker compose up -d
+# 或从源码构建（配置全部来自 .env）
+cp .env.example .env && docker compose up -d
 ```
 
-`docker-compose.yml` 会同时启动网关与 Redis；`config.yaml` 与 `lua/` 通过挂载卷提供。
+容器内 host/port/workers 由 `SERVER_HOST` / `SERVER_PORT` / `SERVER_WORKERS` 控制；修改 `SERVER_PORT` 时记得同步 `docker-compose.yml` 的端口映射。
 
-## 配置
+## 配置（.env 环境变量）
 
-复制 `config.example.yaml` 为 `config.yaml` 并填写：
+复制 `.env.example` 为 `.env` 并填写，优先级：**环境变量 > .env 文件 > 代码默认值**。主要变量：
 
-- `newapi.base_url`：NewAPI 后端地址
-- `redis` / `mysql` / `newapi_mysql`：连接信息与密码
-- `admin.auth_token`：管理 API 认证 token（生产环境必须使用强随机值）
+| 变量 | 说明 |
+|---|---|
+| `NEWAPI_BASE_URL` | NewAPI 后端地址 |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | 外部 Redis 连接 |
+| `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` | 外部 MySQL（网关配置库） |
+| `NEWAPI_MYSQL_*` | NewAPI 数据库（只读，同步 Key→Group） |
+| `SERVER_WORKERS` | uvicorn worker 数 |
+| `ADMIN_AUTH_TOKEN` | 管理 API 认证 token（生产必须强随机值） |
 
-> `config.yaml` 含真实凭据，已被 `.gitignore` 排除，请勿提交。
+> `.env` 含真实凭据，已被 `.gitignore` 排除，请勿提交。
 
 ## CI / 镜像发布
 
@@ -63,5 +68,5 @@ docker compose up -d
 app/            # FastAPI 应用（代理、限速、同步、管理 API）
 lua/            # Redis Lua 原子脚本
 sql/            # 数据库初始化脚本
-config.example.yaml  # 配置模板
+.env.example    # 环境变量配置模板
 ```
