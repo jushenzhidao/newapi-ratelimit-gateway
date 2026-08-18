@@ -1,0 +1,56 @@
+# 限速网关配置
+server:
+  host: "0.0.0.0"
+  port: 8080
+  workers: 4
+
+# NewAPI 后端地址
+newapi:
+  base_url: "http://127.0.0.1:3000"
+  timeout: 300
+
+# Redis 配置
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  password: ""
+  db: 0
+  pool_size: 50
+
+# MySQL 配置 (网关自身的配置库)
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: ""
+  database: "ratelimit_gateway"
+  pool_size: 10
+
+# NewAPI 数据库配置 (只读，用于同步 Key->Group 映射)
+newapi_mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "readonly_user"
+  password: ""
+  database: "new-api"
+  pool_size: 5
+
+# 同步配置
+sync:
+  key_group_interval: 60
+  config_cache_ttl: 60
+  key_map_ttl: 300
+
+# 限速默认行为
+ratelimit:
+  on_key_not_found: "passthrough"
+  on_config_not_found: "passthrough"
+  show_remaining: true
+  # token 模式 + 流式请求时，自动注入 stream_options.include_usage=true
+  # 设为 false 如果上游 LLM 不支持此参数
+  auto_inject_include_usage: true
+
+# 管理后台
+admin:
+  enabled: true
+  auth_token: "change-me-in-production"

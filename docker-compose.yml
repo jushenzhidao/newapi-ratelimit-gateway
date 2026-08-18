@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  gateway:
+    build: .
+    container_name: ratelimit-gateway
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./lua:/app/lua:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - gateway-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: ratelimit-redis
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - gateway-net
+
+volumes:
+  redis-data:
+
+networks:
+  gateway-net:
+    driver: bridge

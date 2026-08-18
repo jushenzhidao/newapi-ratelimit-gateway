@@ -1,0 +1,14 @@
+[project]
+name = "newapi-ratelimit-gateway"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "aiomysql==0.2.0",
+    "fastapi==0.115.6",
+    "httpx==0.28.1",
+    "pydantic-settings==2.7.0",
+    "pyyaml==6.0.2",
+    "redis[hiredis]==5.2.1",
+    "sqlalchemy[asyncio]==2.0.36",
+    "uvicorn[standard]==0.34.0",
+]
