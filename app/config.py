@@ -5,6 +5,8 @@
 Redis / MySQL 均为外部服务，本项目不自带部署。
 """
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_FILE = dict(
@@ -78,8 +80,16 @@ class SyncConfig(BaseSettings):
 class RateLimitConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RATELIMIT_", **_ENV_FILE)
 
-    on_key_not_found: str = "passthrough"
-    on_config_not_found: str = "passthrough"
+    on_key_not_found: Literal["passthrough", "reject"] = "passthrough"
+    on_config_not_found: Literal["passthrough", "reject"] = "passthrough"
+    # Redis 故障时的降级策略：
+    #   passthrough   - 放行全部请求（可用性优先，限速失效）
+    #   reject        - 拒绝请求返回 503（保护上游优先）
+    #   local_fallback- 进程内滑动窗口兜底限速（推荐）
+    on_redis_error: Literal["passthrough", "reject", "local_fallback"] = "local_fallback"
+    # local_fallback 兜底参数：窗口秒数 + 单 key 最大请求数（每个 worker 独立计数，宜保守）
+    fallback_window: int = 60
+    fallback_max_requests: int = 60
     show_remaining: bool = True
     # token 模式 + 流式请求时，自动注入 stream_options.include_usage=true
     # 设为 false 如果上游 LLM 不支持此参数

@@ -110,6 +110,17 @@ async def handle_proxy(request: Request) -> Response:
     result: RateLimitResult = await rate_limiter.check(api_key)
 
     if not result.allowed:
+        # Redis 故障 reject 策略：503 + 短重试间隔（区别于业务限速的 429）
+        if result.reason == "redis_unavailable":
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "service_unavailable",
+                    "message": "Rate limiter backend (Redis) is down",
+                },
+                headers={"Retry-After": "10"},
+            )
+
         response_body = {
             "error": "rate_limit_exceeded",
             "message": f"Rate limit exceeded: {result.reason}",

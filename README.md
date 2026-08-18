@@ -46,8 +46,27 @@ cp .env.example .env && docker compose up -d
 | `NEWAPI_MYSQL_*` | NewAPI 数据库（只读，同步 Key→Group） |
 | `SERVER_WORKERS` | uvicorn worker 数 |
 | `ADMIN_AUTH_TOKEN` | 管理 API 认证 token（生产必须强随机值） |
+| `RATELIMIT_ON_REDIS_ERROR` | Redis 故障降级策略：`passthrough` / `reject` / `local_fallback`（默认） |
+| `RATELIMIT_FALLBACK_WINDOW` / `RATELIMIT_FALLBACK_MAX_REQUESTS` | local_fallback 兜底窗口秒数 / 单 key 最大请求数 |
 
 > `.env` 含真实凭据，已被 `.gitignore` 排除，请勿提交。
+
+## Redis 故障降级
+
+Redis 是限速的唯一后端，故障时的行为由 `RATELIMIT_ON_REDIS_ERROR` 控制：
+
+| 策略 | 行为 | 适用场景 |
+|---|---|---|
+| `passthrough` | 全部放行，限速失效 | 可用性优先，上游额度便宜 |
+| `reject` | 返回 503 + `Retry-After: 10` | 保护上游优先，怕超额结算 |
+| `local_fallback`（默认） | 进程内滑动窗口兜底限速 | 兼顾可用性与止损（推荐） |
+
+其他保障：
+
+- **NOSCRIPT 自愈**：Redis 重启后 Lua 脚本缓存丢失，网关自动重新 `SCRIPT LOAD` 并重试，限速自动恢复，无需重启网关。
+- **`/health` 可观测**：返回 `status`（ok/degraded）、`redis`（up/down）与降级累计计数（`redis_error_total`、`fallback_reject_total` 等）。Redis down 时仍返回 200，避免被负载均衡摘除；告警请按 `status == "degraded"` 触发。
+- **恢复自愈**：keymap / 分组配置由 MySQL 定时同步自动回填；计数器丢失会重置（Redis 开 AOF `appendonly yes` 可把丢失窗口压到 1 秒）。
+- `local_fallback` 为每个 worker 独立计数（多 worker 下实际阈值为 `N × max_requests`），请保守设置。
 
 ## CI / 镜像发布
 

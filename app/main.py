@@ -64,37 +64,52 @@ app.include_router(admin_router)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """健康检查：网关存活 + Redis 连通性 + 降级统计
+
+    注意：Redis down 时仍返回 200（status=degraded），避免被负载均衡摘除
+    导致代理能力整体丢失；告警系统应按 status 字段触发。
+    """
+    redis_ok = await rate_limiter.ping()
+    body = {
+        "status": "ok" if redis_ok else "degraded",
+        "redis": "up" if redis_ok else "down",
+        "degrade_mode": config.ratelimit.on_redis_error,
+    }
+    body.update(rate_limiter.stats())
+    return body
 
 
 @app.get("/ratelimit/status/{api_key}")
 async def ratelimit_status(api_key: str):
     """查询指定 API Key 的当前限速状态"""
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-    group = await rate_limiter._redis.get(f"keymap:{key_hash}")
-    if not group:
-        return {"found": False, "message": "Key not found in cache"}
+    try:
+        group = await rate_limiter._redis.get(f"keymap:{key_hash}")
+        if not group:
+            return {"found": False, "message": "Key not found in cache"}
 
-    config_str = await rate_limiter._redis.get(f"config:{group}")
-    if not config_str:
-        return {"found": False, "group": group, "message": "Config not found in cache"}
+        config_str = await rate_limiter._redis.get(f"config:{group}")
+        if not config_str:
+            return {"found": False, "group": group, "message": "Config not found in cache"}
 
-    conf = json.loads(config_str)
-    now = int(time.time())
-    windows = [("5h", 18000, conf["5h"]), ("7d", 604800, conf["7d"]), ("30d", 2592000, conf["30d"])]
+        conf = json.loads(config_str)
+        now = int(time.time())
+        windows = [("5h", 18000, conf["5h"]), ("7d", 604800, conf["7d"]), ("30d", 2592000, conf["30d"])]
 
-    user_id = group if conf.get("scope") == "group" else key_hash
-    status = {}
-    for name, ttl, limit in windows:
-        if conf.get("type") == "token":
-            used = int(await rate_limiter._redis.get(f"token_usage:{user_id}:{ttl}") or 0)
-        else:
-            key = f"ratelimit:{user_id}:{ttl}"
-            await rate_limiter._redis.zremrangebyscore(key, 0, now - ttl)
-            used = await rate_limiter._redis.zcard(key)
-        status[name] = {"used": used, "limit": limit, "remaining": max(0, limit - used)}
+        user_id = group if conf.get("scope") == "group" else key_hash
+        status = {}
+        for name, ttl, limit in windows:
+            if conf.get("type") == "token":
+                used = int(await rate_limiter._redis.get(f"token_usage:{user_id}:{ttl}") or 0)
+            else:
+                key = f"ratelimit:{user_id}:{ttl}"
+                await rate_limiter._redis.zremrangebyscore(key, 0, now - ttl)
+                used = await rate_limiter._redis.zcard(key)
+            status[name] = {"used": used, "limit": limit, "remaining": max(0, limit - used)}
 
-    return {"found": True, "group": group, "config": conf, "status": status}
+        return {"found": True, "group": group, "config": conf, "status": status}
+    except Exception as e:
+        return {"found": False, "error": f"redis_unavailable: {e}"}
 
 
 @app.api_route(
