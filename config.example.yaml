@@ -1,8 +1,11 @@
-# 限速网关配置
+# 限速网关配置模板
+# 使用方法：cp config.example.yaml config.yaml 后按实际环境填写
+# config.yaml 含真实密码，已被 .gitignore 排除，切勿提交
+
 server:
   host: "0.0.0.0"
   port: 8080
-  workers: 4
+  workers: 16
 
 # NewAPI 后端地址
 newapi:
@@ -13,7 +16,7 @@ newapi:
 redis:
   host: "127.0.0.1"
   port: 6379
-  password: ""
+  password: "<REDIS_PASSWORD>"
   db: 0
   pool_size: 50
 
@@ -22,7 +25,7 @@ mysql:
   host: "127.0.0.1"
   port: 3306
   user: "root"
-  password: ""
+  password: "<MYSQL_PASSWORD>"
   database: "ratelimit_gateway"
   pool_size: 10
 
@@ -31,7 +34,7 @@ newapi_mysql:
   host: "127.0.0.1"
   port: 3306
   user: "readonly_user"
-  password: ""
+  password: "<NEWAPI_MYSQL_PASSWORD>"
   database: "new-api"
   pool_size: 5
 
@@ -53,4 +56,5 @@ ratelimit:
 # 管理后台
 admin:
   enabled: true
-  auth_token: "change-me-in-production"
+  # 生产环境必须改为强随机字符串
+  auth_token: "<ADMIN_AUTH_TOKEN>"

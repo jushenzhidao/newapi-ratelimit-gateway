@@ -1,0 +1,31 @@
+# ===== 敏感信息（勿提交）=====
+# 真实部署配置（含数据库密码/admin token），使用 config.example.yaml 作为模板
+config.yaml
+.env
+.env.*
+*.pem
+*.key
+
+# ===== 与部署无关的本地内容 =====
+.venv/
+.idea/
+.vscode/
+.workbuddy/
+
+# ===== 设计/教学文档（内部资料，与部署无关）=====
+NewAPI-限速网关-完整实施方案.md
+新增产品操作教学文档.md
+docs/internal/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 系统/临时 =====
+.DS_Store
+Thumbs.db
+*.log
