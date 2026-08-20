@@ -8,6 +8,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from sqlalchemy import text, select, func
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from app.config import config
@@ -16,6 +17,7 @@ from app.resolver import resolver
 from app.sync import syncer
 from app.proxy import handle_proxy
 from app.admin import router as admin_router
+from app.models import Base, RateLimitGroup
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,10 +32,61 @@ db_engine = create_async_engine(
 )
 db_session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
 
+# 默认种子数据（与 sql/init.sql 一致）
+DEFAULT_GROUPS = [
+    {"group_name": "default",    "limit_5h": 100,  "limit_7d": 1000,  "limit_30d": 5000,   "limit_type": "request", "scope": "key", "remark": "默认分组"},
+    {"group_name": "vip",        "limit_5h": 500,  "limit_7d": 5000,  "limit_30d": 50000,  "limit_type": "request", "scope": "key", "remark": "VIP分组"},
+    {"group_name": "enterprise", "limit_5h": 2000, "limit_7d": 20000, "limit_30d": 200000, "limit_type": "request", "scope": "key", "remark": "企业分组"},
+    {"group_name": "trial",      "limit_5h": 10,   "limit_7d": 50,    "limit_30d": 200,    "limit_type": "request", "scope": "key", "remark": "试用分组"},
+]
+
+
+async def init_database():
+    """自动建库 + 建表 + 种子数据（如果不存在）"""
+    mysql_cfg = config.mysql
+
+    # Step 1: 连接到 MySQL 服务器（不指定库名），创建数据库
+    server_url = (
+        f"mysql+aiomysql://{mysql_cfg.user}:{mysql_cfg.password}"
+        f"@{mysql_cfg.host}:{mysql_cfg.port}/"
+    )
+    server_engine = create_async_engine(server_url, pool_pre_ping=True)
+    try:
+        async with server_engine.connect() as conn:
+            await conn.execute(text(
+                f"CREATE DATABASE IF NOT EXISTS `{mysql_cfg.database}` "
+                f"DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci"
+            ))
+            await conn.commit()
+        logger.info(f"Database '{mysql_cfg.database}' ready (created if not exists)")
+    finally:
+        await server_engine.dispose()
+
+    # Step 2: 用主 engine 建表（IF NOT EXISTS 语义，已有表不报错）
+    async with db_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Tables verified (created if not exists)")
+
+    # Step 3: 如果表为空，插入种子数据
+    async with db_session_factory() as session:
+        count = await session.scalar(select(func.count()).select_from(RateLimitGroup))
+        if count == 0:
+            for g in DEFAULT_GROUPS:
+                session.add(RateLimitGroup(**g))
+            await session.commit()
+            logger.info(f"Seeded {len(DEFAULT_GROUPS)} default group configs")
+        else:
+            logger.info(f"Table already has {count} rows, skipping seed")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动
+    # 启动：自动建库 + 建表 + 种子数据
+    if config.mysql.auto_init:
+        await init_database()
+    else:
+        logger.info("auto_init disabled, assuming database is ready")
+
     await rate_limiter.init(resolver=resolver)
     await syncer.init(rate_limiter._redis)
     await resolver.init(rate_limiter._redis, db_session_factory, syncer._newapi_engine)

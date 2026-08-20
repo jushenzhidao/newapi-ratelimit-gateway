@@ -54,6 +54,8 @@ class MySQLConfig(BaseSettings):
     password: str = ""
     database: str = "ratelimit_gateway"
     pool_size: int = 10
+    # 启动时自动建库 + 建表 + 种子数据（设为 false 则需手动执行 sql/init.sql）
+    auto_init: bool = True
 
 
 class NewAPIMySQLConfig(BaseSettings):
