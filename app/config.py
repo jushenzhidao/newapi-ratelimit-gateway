@@ -29,6 +29,7 @@ class NewAPIConfig(BaseSettings):
 
     base_url: str = "http://127.0.0.1:3000"
     timeout: int = 300
+    forward_host: str = ""  # 转发到 NewAPI 时使用的 Host 头；为空则由 httpx 按 URL 自动设置
 
 
 class RedisConfig(BaseSettings):

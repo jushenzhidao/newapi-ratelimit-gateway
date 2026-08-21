@@ -44,7 +44,7 @@ cp .env.example .env && docker compose up -d
 
 ```
 Client ──> Nginx (api-mall.chatfire.cn)
-             ├─ /v1/*  ──> 限速网关 (host:39778) ──> NEWAPI_BASE_URL (NewAPI 内部地址)
+             ├─ /v1/*  ──> 限速网关 (host:8080) ──> NEWAPI_BASE_URL (NewAPI 内部地址)
              └─ /*     ──> NewAPI 前端 (原上游，不经网关)
 ```
 
@@ -61,7 +61,7 @@ server {
 
     # ---- API 调用 → 限速网关 ----
     location /v1/ {
-        proxy_pass http://127.0.0.1:39778;   # 限速网关地址（按实际内网 IP 调整）
+        proxy_pass http://127.0.0.1:8080;   # 限速网关地址（按实际内网 IP 调整）
 
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -96,14 +96,15 @@ server {
 
 ```bash
 NEWAPI_BASE_URL=http://127.0.0.1:3000   # NewAPI 内部地址，禁止写公网域名
+NEWAPI_FORWARD_HOST=api-mall.chatfire.cn  # NewAPI 前面有 Nginx 时必须设置，否则 Host 不匹配报 invalid token
 SERVER_HOST=0.0.0.0
-SERVER_PORT=39778                       # 与 Nginx proxy_pass 一致
+SERVER_PORT=8080                        # 与 Nginx proxy_pass 一致
 ```
 
 ### 切换步骤
 
 1. 启动网关，确认 `NEWAPI_BASE_URL` 指向 NewAPI 内部地址
-2. 直接压测网关：`curl http://127.0.0.1:39778/v1/chat/completions -H "Authorization: Bearer sk-xxx"`，确认限速生效、请求能透传到 NewAPI
+2. 直接压测网关：`curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer sk-xxx"`，确认限速生效、请求能透传到 NewAPI
 3. 修改 Nginx 配置，`nginx -t && nginx -s reload`
 4. 验证：客户端调用 `https://api-mall.chatfire.cn/v1/chat/completions`（零改动），检查 `X-RateLimit-*` 响应头或 `/ratelimit/status/{key}` 确认已走网关
 5. 前端访问 `https://api-mall.chatfire.cn/` 确认不受影响
@@ -152,7 +153,8 @@ Docker 部署时 `COPY . .` 已包含 `web/` 目录，无需额外配置。也�
 
 | 变量 | 说明 |
 |---|---|
-| `NEWAPI_BASE_URL` | NewAPI 后端地址 |
+| `NEWAPI_BASE_URL` | NewAPI 后端地址（内部 IP，禁止写公网域名） |
+| `NEWAPI_FORWARD_HOST` | 转发到 NewAPI 时使用的 Host 头；NewAPI 前面有 Nginx 按 server_name 路由时必须设置（如 `api-mall.chatfire.cn`） |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | 外部 Redis 连接 |
 | `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` | 外部 MySQL（网关配置库） |
 | `NEWAPI_MYSQL_*` | NewAPI 数据库（只读，同步 Key→Group） |
@@ -181,6 +183,7 @@ Docker 部署时 `COPY . .` 已包含 `web/` 目录，无需额外配置。也�
 - **熔断器**：Redis 连续失败 5 次后熔断打开，请求立即走降级路径，**不再逐请求等待 Redis 超时**（避免延迟雪崩与连接池耗尽）；10 秒后半开探测，恢复自动闭合。`/health` 的 ping 会反哺熔断状态。
 - **批量配额预取**（请求数模式）：每 worker 一次 EVALSHA 预取 `RATELIMIT_QUOTA_BATCH_SIZE` 个配额本地消耗（flush + 检查 + 预取单次往返完成）。Redis QPS 降为 1/N，且短暂抖动期间（N 个请求内）限速完全不感知。多 worker 并发预取的超发上界约 `(workers-1) × batch_size`，长窗口（5h/7d/30d）场景可接受。
 - **分组感知兜底**：`local_fallback` 模式下，已解析出分组策略的 key 按「5h 限额 ÷ worker 数」执行本地滑动窗口（默认除数 = `SERVER_WORKERS`，可用 `RATELIMIT_FALLBACK_LIMIT_DIVISOR` 覆盖）；解析不到策略时退回全局兜底参数。
+- **失败退还**（请求数模式）：上游请求失败时**无论原因**（网络异常、400/401/429/5xx 等任何非 2xx、流式中断）一律退还本次消耗的配额。本地未 flush 的计数直接弹出并回增预取配额；已 flush 到 Redis 的通过移除各窗口最新一条成员退还。`token` 模式失败本就不扣减。退还在 `/health` 的 `refund_total` 统计中可见。
 
 ### Redis 故障降级
 

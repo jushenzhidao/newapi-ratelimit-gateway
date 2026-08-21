@@ -39,6 +39,11 @@ def _build_forward_headers(request: Request) -> dict:
     for key, value in request.headers.items():
         if key.lower() not in HOP_BY_HOP_HEADERS:
             headers[key] = value
+    # 显式覆盖 Host 头：当 NewAPI 前面有 Nginx 按 server_name 路由时，
+    # httpx 默认用 URL 的 IP 做 Host 会导致路由不匹配（报 invalid token / 404）。
+    # 设置 NEWAPI_FORWARD_HOST=api-mall.chatfire.cn 可让上游 Nginx 正确路由。
+    if config.newapi.forward_host:
+        headers["host"] = config.newapi.forward_host
     return headers
 
 
@@ -179,15 +184,29 @@ async def _proxy_normal(
 ) -> Response:
     async with httpx.AsyncClient(timeout=config.newapi.timeout) as client:
         try:
+            logger.debug(
+                f"Forwarding to NewAPI: {method} {url} | "
+                f"has_auth={'authorization' in headers} | "
+                f"host={headers.get('host', '(from URL)')}"
+            )
             resp = await client.request(method, url, headers=headers, content=body)
         except httpx.RequestError as e:
             logger.error(f"NewAPI request failed: {e}")
+            # 网络层失败：退还配额（无论原因）
+            await rate_limiter.refund(rl_result)
             return JSONResponse(
                 status_code=502,
                 content={"error": "bad_gateway", "message": str(e)},
             )
 
-    if track_usage and resp.status_code == 200:
+    # 非 2xx 一律视为失败：退还配额（无论原因，含 400/401/429/5xx）
+    if not (200 <= resp.status_code < 300):
+        logger.warning(
+            f"NewAPI returned {resp.status_code}: {resp.text[:500]} | "
+            f"url={url} | host={headers.get('host', '(from URL)')}"
+        )
+        await rate_limiter.refund(rl_result)
+    elif track_usage and resp.status_code == 200:
         usage = _extract_usage_from_response(resp)
         if usage:
             api_key = headers.get("authorization", "").replace("Bearer ", "")
@@ -223,38 +242,63 @@ async def _proxy_stream(
         api_key = rate_limiter.normalize_key(api_key)
         # SSE buffer: 累积不完整的 chunk，按 \n\n 分割完整事件
         sse_buffer = ""
+        refunded = False
 
-        async with httpx.AsyncClient(timeout=config.newapi.timeout) as client:
-            async with client.stream(method, url, headers=headers, content=body) as resp:
-                async for chunk in resp.aiter_bytes():
-                    # 先透传，不阻塞客户端
-                    yield chunk
+        async def refund_once():
+            """失败退还（幂等，每请求至多退一次）"""
+            nonlocal refunded
+            if not refunded:
+                refunded = True
+                await rate_limiter.refund(rl_result)
 
-                    if track_usage:
-                        try:
-                            sse_buffer += chunk.decode("utf-8", errors="ignore")
-                            # 按 \n\n 分割完整 SSE 事件
-                            while "\n\n" in sse_buffer:
-                                event_str, sse_buffer = sse_buffer.split("\n\n", 1)
-                                usage_tokens = _extract_usage_from_sse_event(
-                                    event_str, usage_tokens
-                                )
-                        except Exception:
-                            pass
-
-                # 处理 buffer 中可能残留的最后一个事件
-                if track_usage and sse_buffer.strip():
-                    usage_tokens = _extract_usage_from_sse_event(sse_buffer, usage_tokens)
-
-                if track_usage and usage_tokens > 0:
-                    group_config = await rate_limiter.get_group_config(rl_result.group)
-                    if group_config:
-                        user_id = (
-                            rl_result.group
-                            if group_config.get("scope") == "group"
-                            else rate_limiter.hash_key(api_key)
+        try:
+            async with httpx.AsyncClient(timeout=config.newapi.timeout) as client:
+                async with client.stream(method, url, headers=headers, content=body) as resp:
+                    logger.debug(
+                        f"Stream to NewAPI: {method} {url} | "
+                        f"status={resp.status_code} | "
+                        f"host={headers.get('host', '(from URL)')}"
+                    )
+                    # 非 2xx 一律视为失败：退还配额（无论原因）
+                    if not (200 <= resp.status_code < 300):
+                        logger.warning(
+                            f"NewAPI stream returned {resp.status_code} | "
+                            f"url={url} | host={headers.get('host', '(from URL)')}"
                         )
-                        await rate_limiter.deduct_tokens(user_id, usage_tokens)
+                        await refund_once()
+                    async for chunk in resp.aiter_bytes():
+                        # 先透传，不阻塞客户端
+                        yield chunk
+
+                        if track_usage:
+                            try:
+                                sse_buffer += chunk.decode("utf-8", errors="ignore")
+                                # 按 \n\n 分割完整 SSE 事件
+                                while "\n\n" in sse_buffer:
+                                    event_str, sse_buffer = sse_buffer.split("\n\n", 1)
+                                    usage_tokens = _extract_usage_from_sse_event(
+                                        event_str, usage_tokens
+                                    )
+                            except Exception:
+                                pass
+
+                    # 处理 buffer 中可能残留的最后一个事件
+                    if track_usage and sse_buffer.strip():
+                        usage_tokens = _extract_usage_from_sse_event(sse_buffer, usage_tokens)
+
+                    if track_usage and usage_tokens > 0:
+                        group_config = await rate_limiter.get_group_config(rl_result.group)
+                        if group_config:
+                            user_id = (
+                                rl_result.group
+                                if group_config.get("scope") == "group"
+                                else rate_limiter.hash_key(api_key)
+                            )
+                            await rate_limiter.deduct_tokens(user_id, usage_tokens)
+        except httpx.RequestError as e:
+            # 流中途失败（连接断开/超时等）：退还配额
+            logger.error(f"NewAPI stream failed: {e}")
+            await refund_once()
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 

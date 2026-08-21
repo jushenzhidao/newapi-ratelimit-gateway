@@ -66,11 +66,17 @@ class RateLimitResult:
         reason: str = "",
         group: Optional[str] = None,
         remaining: Optional[dict] = None,
+        user_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        limits: Optional[tuple] = None,
     ):
         self.allowed = allowed
         self.reason = reason
         self.group = group
         self.remaining = remaining or {}
+        self.user_id = user_id   # 限速主体（key hash 或 group 名）
+        self.mode = mode         # "request" / "token" / None（passthrough 无消耗）
+        self.limits = limits     # (5h, 7d, 30d)
 
 
 class _QuotaState:
@@ -117,6 +123,7 @@ class RateLimiter:
             "fallback_reject_total": 0,
             "batch_reserve_total": 0,
             "circuit_fast_fail_total": 0,
+            "refund_total": 0,
             "last_redis_error": "",
             "last_redis_error_at": 0.0,
         }
@@ -217,6 +224,61 @@ class RateLimiter:
                 logger.error(f"Token deduct failed: {e}")
                 return
 
+    async def refund(self, rl_result: RateLimitResult) -> None:
+        """退还一次请求配额（上游请求失败时调用，无论失败原因）
+
+        仅 request 模式有效（token 模式失败本就不扣减，refund 为 no-op）。
+
+        退还策略：
+        1. Redis 故障期间的本地兜底窗口 → 弹出兜底 deque 最新一条
+        2. 本地未 flush 的计数还在 deque → 弹出最新一条 + reserved 回增
+           （滑动窗口按计数语义生效，弹出的时间戳属于哪次请求不影响总量正确性）
+        3. 该请求已 flush 到 Redis → 移除各窗口最新一条成员（ZREMRANGEBYRANK）
+
+        精度说明：并发场景下（退还时 deque 中已有其他在途请求的时间戳），
+        退还总量依然正确，最多导致极小的瞬时超发（≤ 在途失败数）。
+        """
+        if not rl_result or not rl_result.allowed:
+            return
+        if rl_result.mode != "request" or not rl_result.user_id:
+            return
+        # 仅正常消耗（reason=""）与本地兜底窗口消耗需要退还；
+        # passthrough 等路径未产生任何计数，退还反而会误删别人的计数
+        if rl_result.reason not in ("", "redis_error_local_fallback"):
+            return
+
+        self._stats["refund_total"] += 1
+
+        # Redis 故障期间的本地兜底窗口
+        if rl_result.reason == "redis_error_local_fallback":
+            dq = self._fallback_windows.get(rl_result.user_id)
+            if dq:
+                dq.pop()
+            return
+
+        st = self._quota_states.get(rl_result.user_id)
+        if st is not None and st.deque:
+            # 退还本地未 flush 的一次计数：弹出最新时间戳 + 回增预取配额
+            st.deque.pop()
+            st.reserved += 1
+            limit_map = dict(zip(("5h", "7d", "30d"), rl_result.limits)) \
+                if rl_result.limits else {}
+            for name in ("5h", "7d", "30d"):
+                if name in st.remaining:
+                    v = st.remaining[name] + 1
+                    cap = limit_map.get(name)
+                    st.remaining[name] = min(v, cap) if cap else v
+            return
+
+        # 该请求的时间戳已 flush 到 Redis：移除各窗口最新一条成员
+        try:
+            for ttl in (18000, 604800, 2592000):
+                key = f"ratelimit:{rl_result.user_id}:{ttl}"
+                await self._redis.zremrangebyrank(key, -1, -1)
+        except Exception as e:
+            # Redis 故障时放弃本次退还（误差 ≤1 次，随窗口过期自愈）
+            logger.warning(f"Refund via redis failed: {e}")
+
     async def get_group_config(self, group: str) -> Optional[dict]:
         """获取分组的限速配置（走三级解析）"""
         return await self._resolver._resolve_config(group)
@@ -275,7 +337,8 @@ class RateLimiter:
         )
         if snapshot_fresh and flush_rem_5h > 0 and len(st.deque) >= flush_rem_5h:
             return RateLimitResult(allowed=False, reason="5h_exceeded", group=group,
-                                   remaining={"5h": 0})
+                                   remaining={"5h": 0}, user_id=user_id,
+                                   mode="request", limits=limits)
 
         # 本地还有预取配额：直接消耗，不访问 Redis
         if st.reserved > 0:
@@ -285,7 +348,8 @@ class RateLimiter:
                 if name in st.remaining and st.remaining[name] > 0:
                     st.remaining[name] -= 1
             self._cleanup_quota_states()
-            return RateLimitResult(allowed=True, group=group, remaining=dict(st.remaining))
+            return RateLimitResult(allowed=True, group=group, remaining=dict(st.remaining),
+                                   user_id=user_id, mode="request", limits=limits)
 
         # 预取配额耗尽：flush 本地计数 + 检查 + 重新预取（单次往返）
         flush = list(st.deque)[-_MAX_FLUSH_BATCH:] if st.deque else []
@@ -297,7 +361,8 @@ class RateLimiter:
                 json.dumps(flush),
             )
         except Exception as e:
-            return await self._degrade(user_id, e, group=group, limits=limits)
+            return await self._degrade(user_id, e, group=group, limits=limits,
+                                       mode="request")
 
         self._stats["batch_reserve_total"] += 1
         code = result[0]
@@ -308,7 +373,8 @@ class RateLimiter:
             st._last_flush_at = time.monotonic()
             st.deque.clear()
             return RateLimitResult(allowed=False, reason=f"{window}_exceeded",
-                                   group=group, remaining={window: 0})
+                                   group=group, remaining={window: 0},
+                                   user_id=user_id, mode="request", limits=limits)
 
         reserve = int(result[1]) if len(result) > 1 else 1
         st.remaining = {"5h": result[2], "7d": result[3], "30d": result[4]} \
@@ -326,7 +392,8 @@ class RateLimiter:
                 st.remaining[name] -= 1
 
         self._cleanup_quota_states()
-        return RateLimitResult(allowed=True, group=group, remaining=dict(st.remaining))
+        return RateLimitResult(allowed=True, group=group, remaining=dict(st.remaining),
+                               user_id=user_id, mode="request", limits=limits)
 
     def _cleanup_quota_states(self):
         if len(self._quota_states) <= _MAX_TRACKED_KEYS:
@@ -348,16 +415,19 @@ class RateLimiter:
                 "_token_check_sha", 1, user_id, limits[0], limits[1], limits[2]
             )
         except Exception as e:
-            return await self._degrade(user_id, e, group=group, limits=limits)
+            return await self._degrade(user_id, e, group=group, limits=limits,
+                                       mode="token")
 
         code = result[0]
         if code == 0:
             window = result[1] if len(result) > 1 else "unknown"
             return RateLimitResult(allowed=False, reason=f"{window}_exceeded",
-                                   group=group, remaining={window: 0})
+                                   group=group, remaining={window: 0},
+                                   user_id=user_id, mode="token", limits=limits)
         remaining = {"5h": result[1], "7d": result[2], "30d": result[3]} \
             if len(result) > 3 else {}
-        return RateLimitResult(allowed=True, group=group, remaining=remaining)
+        return RateLimitResult(allowed=True, group=group, remaining=remaining,
+                               user_id=user_id, mode="token", limits=limits)
 
     # ---------- Redis 调用（熔断 + NOSCRIPT 自愈）----------
 
@@ -388,19 +458,21 @@ class RateLimiter:
     # ---------- Redis 故障降级 ----------
 
     async def _degrade(self, user_id: str, err: Exception,
-                       group: Optional[str] = None, limits=None) -> RateLimitResult:
+                       group: Optional[str] = None, limits=None,
+                       mode: str = "request") -> RateLimitResult:
         """Redis 异常时按配置策略降级（已解析出分组策略时做分组感知兜底）"""
         self._stats["redis_error_total"] += 1
         self._stats["last_redis_error"] = f"{type(err).__name__}: {err}"[:300]
         self._stats["last_redis_error_at"] = time.time()
         logger.error(f"Redis unavailable, degrade mode={config.ratelimit.on_redis_error}: {err}")
 
-        mode = config.ratelimit.on_redis_error
-        if mode == "reject":
+        mode_cfg = config.ratelimit.on_redis_error
+        if mode_cfg == "reject":
             self._stats["degrade_reject_total"] += 1
-            return RateLimitResult(allowed=False, reason="redis_unavailable", group=group)
+            return RateLimitResult(allowed=False, reason="redis_unavailable", group=group,
+                                   user_id=user_id, mode=mode, limits=limits)
 
-        if mode == "local_fallback":
+        if mode_cfg == "local_fallback":
             # 分组感知兜底：按 5h 限额 ÷ worker 数 执行本地滑动窗口
             if limits:
                 divisor = config.ratelimit.fallback_limit_divisor or max(
@@ -416,14 +488,17 @@ class RateLimiter:
             if allowed:
                 self._stats["fallback_allow_total"] += 1
                 return RateLimitResult(allowed=True, group=group,
-                                       reason="redis_error_local_fallback")
+                                       reason="redis_error_local_fallback",
+                                       user_id=user_id, mode=mode, limits=limits)
             self._stats["fallback_reject_total"] += 1
             return RateLimitResult(allowed=False, group=group,
-                                   reason="local_fallback_limit")
+                                   reason="local_fallback_limit",
+                                   user_id=user_id, mode=mode, limits=limits)
 
         # passthrough（默认）
         self._stats["degrade_passthrough_total"] += 1
-        return RateLimitResult(allowed=True, group=group, reason="redis_error_passthrough")
+        return RateLimitResult(allowed=True, group=group, reason="redis_error_passthrough",
+                               user_id=user_id, mode=mode, limits=limits)
 
     async def _local_window_allow(self, key: str, window: float, max_reqs: int) -> bool:
         """进程内滑动窗口（事件循环内无 await，天然无并发竞争）"""

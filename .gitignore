@@ -1,6 +1,7 @@
 # ===== 敏感信息（勿提交）=====
 # 真实部署配置（含数据库密码/admin token），使用 config.example.yaml 作为模板
 config.yaml
+生产.env
 .env
 .env.*
 !.env.example
