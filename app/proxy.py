@@ -191,6 +191,7 @@ async def _proxy_normal(
         usage = _extract_usage_from_response(resp)
         if usage:
             api_key = headers.get("authorization", "").replace("Bearer ", "")
+            api_key = rate_limiter.normalize_key(api_key)
             group_config = await rate_limiter.get_group_config(rl_result.group)
             if group_config:
                 user_id = (
@@ -219,6 +220,7 @@ async def _proxy_stream(
     async def stream_generator():
         usage_tokens = 0
         api_key = headers.get("authorization", "").replace("Bearer ", "")
+        api_key = rate_limiter.normalize_key(api_key)
         # SSE buffer: 累积不完整的 chunk，按 \n\n 分割完整事件
         sse_buffer = ""
 

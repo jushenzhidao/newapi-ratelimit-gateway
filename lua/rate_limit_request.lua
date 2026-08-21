@@ -26,32 +26,43 @@ local windows = {
     {2592000, tonumber(ARGV[5]), "30d"}
 }
 
-local avail = nil
-local remaining = {}
-
+-- ── Phase 1: flush 到所有窗口 ──
+-- 必须先 flush 全部窗口，再做超限判断。
+-- 否则 5h 超限时早返回，7d/30d 从未 flush → 跨窗口计数断裂。
 for i, w in ipairs(windows) do
-    local ttl, limit, name = w[1], w[2], w[3]
+    local ttl = w[1]
     local key = "ratelimit:" .. uid .. ":" .. ttl
     redis.call("ZREMRANGEBYSCORE", key, 0, now - ttl)
-
-    -- flush 本地累计的真实请求（时间戳为实际发生时间）
     for _, ts in ipairs(flush) do
         redis.call("ZADD", key, ts, tostring(ts) .. ":" .. math.random(100000000))
     end
     if #flush > 0 then
         redis.call("EXPIRE", key, ttl)
     end
+end
 
+-- ── Phase 2: 检查所有窗口 ──
+local avail = nil
+local remaining = {}
+local exceeded = nil
+
+for i, w in ipairs(windows) do
+    local ttl, limit, name = w[1], w[2], w[3]
+    local key = "ratelimit:" .. uid .. ":" .. ttl
     local count = redis.call("ZCARD", key)
     remaining[i] = limit - count
 
-    if count >= limit then
-        return {0, name, limit, count}
+    if count >= limit and exceeded == nil then
+        exceeded = {0, name, limit, count}
     end
     local a = limit - count
     if avail == nil or a < avail then
         avail = a
     end
+end
+
+if exceeded then
+    return exceeded
 end
 
 -- 预取配额不在 Redis 端占位（避免幻影计数），多 worker 并发预取的

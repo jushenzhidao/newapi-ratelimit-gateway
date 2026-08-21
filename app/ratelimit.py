@@ -76,12 +76,14 @@ class RateLimitResult:
 class _QuotaState:
     """请求数模式的本地配额状态（每 worker 独立）"""
 
-    __slots__ = ("deque", "reserved", "remaining", "last_used")
+    __slots__ = ("deque", "reserved", "remaining", "_redis_remaining", "_last_flush_at", "last_used")
 
     def __init__(self):
-        self.deque = deque()      # 已本地计数、待 flush 的请求时间戳（5h 保留）
+        self.deque = deque()      # 本地已消耗但未 flush 的请求时间戳（flush 后清空）
         self.reserved = 0         # 本地剩余预取配额
-        self.remaining = {}       # 最近一次预取返回的各窗口剩余
+        self.remaining = {}       # 对外展示的各窗口剩余（随本地消耗递减）
+        self._redis_remaining = {}  # flush 时 Redis 侧的剩余快照（不随本地消耗变化，用于本地超限检查）
+        self._last_flush_at = 0.0    # 上次 Lua flush 的 monotonic 时间（用于判断快照是否过期）
         self.last_used = time.monotonic()
 
     def trim(self, window: int, now: int):
@@ -150,14 +152,29 @@ class RateLimiter:
             await self._redis.aclose()
 
     @staticmethod
+    def normalize_key(api_key: str) -> str:
+        """去除 sk- 前缀，与 NewAPI 数据库 tokens.key 列的存储格式保持一致。
+
+        NewAPI 在查询 tokens 表前会 strip 掉 sk- 前缀（见 NewAPI 源码
+        model/token.go: strings.TrimPrefix(token, "sk-")），因此数据库中
+        存储的是不带前缀的原始 key。本方法确保网关侧的哈希和查询使用
+        相同的规范化形式，避免 keymap 查不到导致限速静默失效。
+        """
+        if api_key and api_key.startswith("sk-"):
+            return api_key[3:]
+        return api_key
+
+    @staticmethod
     def hash_key(api_key: str) -> str:
-        """对 API Key 做 SHA256 哈希"""
+        """对 API Key 做 SHA256 哈希（自动去除 sk- 前缀）"""
+        api_key = RateLimiter.normalize_key(api_key)
         return hashlib.sha256(api_key.encode()).hexdigest()
 
     # ---------- 对外主入口 ----------
 
     async def check(self, api_key: str) -> RateLimitResult:
         """检查请求是否允许通过"""
+        api_key = self.normalize_key(api_key)
         key_hash = self.hash_key(api_key)
 
         # 1. 三级解析（L1 → Redis → MySQL，内部已捕获异常，不会抛出）
@@ -204,6 +221,39 @@ class RateLimiter:
         """获取分组的限速配置（走三级解析）"""
         return await self._resolver._resolve_config(group)
 
+    async def get_quota_status(self, user_id: str, conf: dict) -> dict:
+        """查询配额状态：Redis 已 flush 计数 + 本地未 flush 计数
+
+        多 worker 部署时，本方法只能看到当前 worker 的本地 deque，
+        其他 worker 的未 flush 计数不可见，total_used 为下界估计。
+        """
+        now = int(time.time())
+        windows = [("5h", 18000, int(conf["5h"])),
+                   ("7d", 604800, int(conf["7d"])),
+                   ("30d", 2592000, int(conf["30d"]))]
+
+        # 本地未 flush 的请求数（flush 后会写入所有窗口，因此加到所有窗口）
+        st = self._quota_states.get(user_id)
+        local_unflushed = len(st.deque) if st else 0
+
+        status = {}
+        for name, ttl, limit in windows:
+            if conf.get("type") == "token":
+                used = int(await self._redis.get(f"token_usage:{user_id}:{ttl}") or 0)
+            else:
+                key = f"ratelimit:{user_id}:{ttl}"
+                await self._redis.zremrangebyscore(key, 0, now - ttl)
+                redis_used = await self._redis.zcard(key)
+                # 本地未 flush 的请求会写入所有窗口，因此全部加上
+                used = redis_used + local_unflushed
+            status[name] = {
+                "used": used,
+                "limit": limit,
+                "remaining": max(0, limit - used),
+            }
+
+        return status
+
     # ---------- 请求数模式：批量配额 ----------
 
     async def _check_request(self, user_id: str, group: str, limits) -> RateLimitResult:
@@ -214,8 +264,16 @@ class RateLimiter:
         st.last_used = time.monotonic()
         st.trim(18000, now)
 
-        # 本地已知 5h 窗口超限（deque 覆盖整个 5h，flush 之前也生效）
-        if len(st.deque) >= limits[0]:
+        # 本地已知 5h 窗口超限：本地未 flush 的请求数 >= flush 时 Redis 侧剩余
+        # （总已用 = Redis 已 flush + 本地未 flush，当本地未 flush >= Redis 剩余时即超限）
+        # 仅当快照新鲜（< local_cache_ttl）时才本地拦截，防止 Redis 数据已过期但
+        # _redis_remaining 仍为 0 导致永久死锁（用户被 block 无法触发 Lua 刷新）
+        flush_rem_5h = st._redis_remaining.get("5h", limits[0])
+        snapshot_fresh = (
+            st._last_flush_at > 0
+            and (time.monotonic() - st._last_flush_at) < config.ratelimit.local_cache_ttl
+        )
+        if snapshot_fresh and flush_rem_5h > 0 and len(st.deque) >= flush_rem_5h:
             return RateLimitResult(allowed=False, reason="5h_exceeded", group=group,
                                    remaining={"5h": 0})
 
@@ -246,12 +304,20 @@ class RateLimiter:
         if code == 0:
             window = result[1] if len(result) > 1 else "unknown"
             st.remaining = {window: 0}
+            st._redis_remaining = {window: 0}
+            st._last_flush_at = time.monotonic()
+            st.deque.clear()
             return RateLimitResult(allowed=False, reason=f"{window}_exceeded",
                                    group=group, remaining={window: 0})
 
         reserve = int(result[1]) if len(result) > 1 else 1
         st.remaining = {"5h": result[2], "7d": result[3], "30d": result[4]} \
             if len(result) > 4 else {}
+        # 快照 Redis 侧剩余（不随本地消耗递减，用于本地超限检查）
+        st._redis_remaining = dict(st.remaining)
+        st._last_flush_at = time.monotonic()
+        # 清空已 flush 的 deque，防止下次 flush 重复 ZADD 导致 Redis 计数虚高
+        st.deque.clear()
         # 当前请求消耗 1 个配额
         st.reserved = max(0, reserve - 1)
         st.deque.append(now)

@@ -49,6 +49,9 @@ class KeyGroupSyncer:
             count = 0
             for row in rows:
                 api_key = row[0]
+                # 防御性去除 sk- 前缀，确保与网关侧 hash_key() 使用的规范化形式一致
+                if api_key and api_key.startswith("sk-"):
+                    api_key = api_key[3:]
                 group = row[1] if row[1] else "default"
                 key_hash = hashlib.sha256(api_key.encode()).hexdigest()
                 pipe.set(f"keymap:{key_hash}", group, ex=config.sync.key_map_ttl)

@@ -139,35 +139,29 @@ async def health():
 
 @app.get("/ratelimit/status/{api_key}")
 async def ratelimit_status(api_key: str):
-    """查询指定 API Key 的当前限速状态"""
+    """查询指定 API Key 的当前限速状态
+
+    走三级解析器（L1 → Redis → MySQL），不直接读 Redis keymap/config，
+    确保 Redis 刚重启或 L1 命中时也能正确返回分组和配置。
+    配额计数合并 Redis 已 flush + 本地未 flush，比纯读 Redis 更准确。
+    """
+    api_key = rate_limiter.normalize_key(api_key)
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
     try:
-        group = await rate_limiter._redis.get(f"keymap:{key_hash}")
+        # 三级解析：L1 缓存 → Redis → MySQL 读透
+        group, conf = await resolver.resolve(api_key, key_hash)
         if not group:
-            return {"found": False, "message": "Key not found in cache"}
-
-        config_str = await rate_limiter._redis.get(f"config:{group}")
-        if not config_str:
-            return {"found": False, "group": group, "message": "Config not found in cache"}
-
-        conf = json.loads(config_str)
-        now = int(time.time())
-        windows = [("5h", 18000, conf["5h"]), ("7d", 604800, conf["7d"]), ("30d", 2592000, conf["30d"])]
+            return {"found": False, "message": "Key not found (not in any group)"}
+        if not conf:
+            return {"found": True, "group": group, "message": "Group config not found"}
 
         user_id = group if conf.get("scope") == "group" else key_hash
-        status = {}
-        for name, ttl, limit in windows:
-            if conf.get("type") == "token":
-                used = int(await rate_limiter._redis.get(f"token_usage:{user_id}:{ttl}") or 0)
-            else:
-                key = f"ratelimit:{user_id}:{ttl}"
-                await rate_limiter._redis.zremrangebyscore(key, 0, now - ttl)
-                used = await rate_limiter._redis.zcard(key)
-            status[name] = {"used": used, "limit": limit, "remaining": max(0, limit - used)}
+        status = await rate_limiter.get_quota_status(user_id, conf)
 
         return {"found": True, "group": group, "config": conf, "status": status}
     except Exception as e:
-        return {"found": False, "error": f"redis_unavailable: {e}"}
+        return {"found": False, "error": f"lookup_failed: {e}"}
 
 
 @app.api_route(
