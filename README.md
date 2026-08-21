@@ -34,6 +34,118 @@ cp .env.example .env && docker compose up -d
 
 容器内 host/port/workers 由 `SERVER_HOST` / `SERVER_PORT` / `SERVER_WORKERS` 控制；修改 `SERVER_PORT` 时记得同步 `docker-compose.yml` 的端口映射。
 
+## 生产上线：无缝切换方案
+
+### 场景
+
+客户端已直接调用 `https://api-mall.chatfire.cn/v1/chat/completions`（NewAPI 公网域名，**前端 UI 也在此域名上**）。目标：无感切换到限速网关，API 调用走网关限速，前端 UI 不受影响，客户端零改动。
+
+### 架构
+
+```
+Client ──> Nginx (api-mall.chatfire.cn)
+             ├─ /v1/*  ──> 限速网关 (host:39778) ──> NEWAPI_BASE_URL (NewAPI 内部地址)
+             └─ /*     ──> NewAPI 前端 (原上游，不经网关)
+```
+
+⚠️ **核心原则：`NEWAPI_BASE_URL` 必须指向 NewAPI 的内部地址**（如 `http://127.0.0.1:3000`），**绝不能**写成公网域名 `https://api-mall.chatfire.cn/v1`——否则 Nginx 将 `/v1/` 路由到网关后，网关又请求公网域名，请求再次回到 Nginx → 网关 → 死循环。
+
+### Nginx 配置
+
+在 `api-mall.chatfire.cn` 的 server block 中新增 `/v1/` 分流（其余保持原样）：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name api-mall.chatfire.cn;
+
+    # ---- API 调用 → 限速网关 ----
+    location /v1/ {
+        proxy_pass http://127.0.0.1:39778;   # 限速网关地址（按实际内网 IP 调整）
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 流式响应必须关闭缓冲
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # LLM 流式调用耗时较长
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    # ---- 其余请求 → NewAPI 前端（原配置不变）----
+    location / {
+        proxy_pass http://127.0.0.1:3000;   # NewAPI 原上游
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+> 若网关与 NewAPI 不在同一台机器：`proxy_pass` 指向网关内网 IP，`NEWAPI_BASE_URL` 指向 NewAPI 内网 IP（如 `http://10.0.1.5:3000`）。
+
+### 网关 .env 关键配置
+
+```bash
+NEWAPI_BASE_URL=http://127.0.0.1:3000   # NewAPI 内部地址，禁止写公网域名
+SERVER_HOST=0.0.0.0
+SERVER_PORT=39778                       # 与 Nginx proxy_pass 一致
+```
+
+### 切换步骤
+
+1. 启动网关，确认 `NEWAPI_BASE_URL` 指向 NewAPI 内部地址
+2. 直接压测网关：`curl http://127.0.0.1:39778/v1/chat/completions -H "Authorization: Bearer sk-xxx"`，确认限速生效、请求能透传到 NewAPI
+3. 修改 Nginx 配置，`nginx -t && nginx -s reload`
+4. 验证：客户端调用 `https://api-mall.chatfire.cn/v1/chat/completions`（零改动），检查 `X-RateLimit-*` 响应头或 `/ratelimit/status/{key}` 确认已走网关
+5. 前端访问 `https://api-mall.chatfire.cn/` 确认不受影响
+
+### 回滚方案
+
+改回 Nginx（把 `location /v1/` 的 `proxy_pass` 指回 NewAPI 原上游）并 reload，客户端即刻恢复直连 NewAPI，无需动客户端配置。
+
+## Web 管理后台
+
+项目自带一个现代化管理后台（`./web/`，纯静态 SPA，无需构建），覆盖管理 API 全功能：分组 CRUD、启停、手动同步、Key 限速状态查询。
+
+### 访问方式
+
+网关已内置静态挂载，启动后直接访问：
+
+```
+http://<网关地址>:<SERVER_PORT>/web/
+```
+
+Docker 部署时 `COPY . .` 已包含 `web/` 目录，无需额外配置。也可以单独用任意静态服务器托管 `./web/`（登录时填网关地址即可跨域访问，网关默认开放 CORS）。
+
+### 登录
+
+- 填写**网关地址**（如 `http://127.0.0.1:8080`）和 **管理 Token**（`ADMIN_AUTH_TOKEN`）
+- 登录即调用 `GET /admin/groups` 验证：**请求成功即鉴权通过**，Token 仅保存在浏览器 localStorage
+- 会话自动探测：刷新页面时若 Token 仍有效直接进入主界面
+
+### 功能
+
+| 功能 | 对应接口 |
+|---|---|
+| 新建 / 编辑 / 禁用 / 启用分组 | `POST` / `PUT` / `DELETE /admin/groups[...]` |
+| 手动同步 Key→分组映射 | `POST /admin/sync` |
+| Key 限速状态查询（含配额使用率进度条） | `GET /ratelimit/status/{api_key}` |
+| 明暗主题切换、Toast 提示、表单校验 | — |
+
+### 安全说明
+
+- 网关 CORS 默认允许任意来源（`ADMIN_CORS_ORIGINS=*`）；鉴权完全依赖 Bearer Token（无 Cookie，不受 CSRF 影响），风险可控
+- 生产环境建议用 `ADMIN_CORS_ORIGINS` 收紧为管理台实际域名，并在 Nginx 层为 `/web/` 与 `/admin/*` 增加访问控制（如 IP 白名单 / 基础认证）
+
 ## 配置（.env 环境变量）
 
 复制 `.env.example` 为 `.env` 并填写，优先级：**环境变量 > .env 文件 > 代码默认值**。主要变量：
@@ -46,6 +158,7 @@ cp .env.example .env && docker compose up -d
 | `NEWAPI_MYSQL_*` | NewAPI 数据库（只读，同步 Key→Group） |
 | `SERVER_WORKERS` | uvicorn worker 数 |
 | `ADMIN_AUTH_TOKEN` | 管理 API 认证 token（生产必须强随机值） |
+| `ADMIN_CORS_ORIGINS` | 管理后台跨域白名单，逗号分隔；默认 `*`（生产建议收紧） |
 | `RATELIMIT_ON_REDIS_ERROR` | Redis 故障降级策略：`passthrough` / `reject` / `local_fallback`（默认） |
 | `RATELIMIT_FALLBACK_LIMIT_DIVISOR` | 分组感知兜底除数（0 = 自动用 `SERVER_WORKERS`） |
 | `RATELIMIT_CIRCUIT_BREAKER_*` | 熔断器：开关 / 失败阈值（默认 5）/ 打开秒数（默认 10） |
@@ -111,5 +224,6 @@ uv run python scripts/smoke_ha.py   # 熔断/L1/读透/批量配额/兜底 六�
 app/            # FastAPI 应用（代理、限速、同步、管理 API）
 lua/            # Redis Lua 原子脚本
 sql/            # 数据库初始化脚本
+web/            # 管理后台静态页面（网关 /web 挂载）
 .env.example    # 环境变量配置模板
 ```

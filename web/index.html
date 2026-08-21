@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>限速网关管理台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ======================= 登录视图 ======================= -->
+  <div id="login-view" class="login-wrap hidden">
+    <div class="login-card">
+      <div class="login-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2l8 3.5v5.2c0 5-3.4 9.6-8 11.3-4.6-1.7-8-6.3-8-11.3V5.5L12 2z"/>
+          <path d="M9 12l2 2 4-4.5"/>
+        </svg>
+      </div>
+      <h1>限速网关管理台</h1>
+      <p class="login-sub">NewAPI Rate Limit Gateway · Admin</p>
+
+      <form id="login-form" autocomplete="off">
+        <label class="field">
+          <span>网关地址</span>
+          <input id="login-base" type="url" placeholder="http://127.0.0.1:8080" required />
+        </label>
+        <label class="field">
+          <span>管理 Token</span>
+          <input id="login-token" type="password" placeholder="ADMIN_AUTH_TOKEN" required />
+          <button type="button" class="eye" id="eye-toggle" aria-label="显示/隐藏">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </label>
+        <button class="btn btn-primary btn-block" id="login-btn" type="submit">
+          <span class="spinner hidden"></span><span id="login-btn-text">登 录</span>
+        </button>
+        <p class="login-hint">使用管理接口 <code>GET /admin/groups</code> 验证：<br />请求成功即鉴权通过</p>
+      </form>
+    </div>
+  </div>
+
+  <!-- ======================= 主视图 ======================= -->
+  <div id="app-view" class="app hidden">
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="topbar-logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2l8 3.5v5.2c0 5-3.4 9.6-8 11.3-4.6-1.7-8-6.3-8-11.3V5.5L12 2z"/>
+            <path d="M9 12l2 2 4-4.5"/>
+          </svg>
+        </div>
+        <div>
+          <h1>限速网关管理台</h1>
+          <span class="topbar-sub" id="topbar-base"></span>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <button class="btn btn-ghost" id="btn-check-key" title="查询某个 API Key 的限速状态">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
+          Key 查询
+        </button>
+        <button class="btn btn-ghost" id="btn-sync" title="立即从 NewAPI 数据库同步 Key→分组映射">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          手动同步
+        </button>
+        <button class="btn btn-icon" id="btn-theme" title="切换主题" aria-label="切换主题">
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <button class="btn btn-ghost btn-danger-text" id="btn-logout">登出</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>分组限速策略</h2>
+            <p class="panel-desc">共 <b id="group-count">0</b> 个分组 · 按 NewAPI tokens 分组粒度生效</p>
+          </div>
+          <button class="btn btn-primary" id="btn-create">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            新建分组
+          </button>
+        </div>
+
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>分组名</th>
+                <th class="num">5h 配额</th>
+                <th class="num">7d 配额</th>
+                <th class="num">30d 配额</th>
+                <th>类型</th>
+                <th>粒度</th>
+                <th>状态</th>
+                <th>备注</th>
+                <th>更新时间</th>
+                <th class="ops">操作</th>
+              </tr>
+            </thead>
+            <tbody id="group-tbody"></tbody>
+          </table>
+          <div id="table-empty" class="empty hidden">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            </div>
+            <p>暂无分组数据</p>
+            <span>点击「新建分组」创建第一个限速策略</span>
+          </div>
+          <div id="table-loading" class="loading-row">
+            <span class="spinner"></span><em>加载中…</em>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <span id="foot-ver">NewAPI Rate Limit Gateway</span>
+      </footer>
+    </main>
+  </div>
+
+  <!-- ======================= 分组编辑模态框 ======================= -->
+  <div id="modal" class="modal-mask hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="modal-title">新建分组</h3>
+        <button class="modal-close" data-close aria-label="关闭">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <form id="group-form">
+        <input type="hidden" id="f-orig-name" />
+        <label class="field">
+          <span>分组名称 <i id="f-name-hint"></i></span>
+          <input id="f-name" maxlength="64" placeholder="如 kefu-pro" required />
+        </label>
+        <div class="grid-3">
+          <label class="field">
+            <span>5 小时配额</span>
+            <input id="f-limit-5h" type="number" min="1" step="1" placeholder="10" required />
+          </label>
+          <label class="field">
+            <span>7 天配额</span>
+            <input id="f-limit-7d" type="number" min="1" step="1" placeholder="20" required />
+          </label>
+          <label class="field">
+            <span>30 天配额</span>
+            <input id="f-limit-30d" type="number" min="1" step="1" placeholder="100" required />
+          </label>
+        </div>
+        <div class="grid-2">
+          <label class="field">
+            <span>限速类型</span>
+            <select id="f-type">
+              <option value="request">request · 按请求数</option>
+              <option value="token">token · 按消耗 token 数</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>限速粒度</span>
+            <select id="f-scope">
+              <option value="key">key · 每个 Key 独立配额</option>
+              <option value="group">group · 全组共享配额</option>
+            </select>
+          </label>
+        </div>
+        <label class="field">
+          <span>状态</span>
+          <select id="f-status">
+            <option value="1">启用</option>
+            <option value="0">禁用</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>备注</span>
+          <input id="f-remark" maxlength="256" placeholder="用途说明（可选）" />
+        </label>
+        <div class="modal-foot">
+          <button type="button" class="btn btn-ghost" data-close>取消</button>
+          <button type="submit" class="btn btn-primary" id="modal-save">
+            <span class="spinner hidden"></span><span>保存</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ======================= Key 状态查询模态框 ======================= -->
+  <div id="key-modal" class="modal-mask hidden" role="dialog" aria-modal="true">
+    <div class="modal modal-lg">
+      <div class="modal-head">
+        <h3>Key 限速状态查询</h3>
+        <button class="modal-close" data-close aria-label="关闭">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <form id="key-form">
+        <div class="key-query-row">
+          <label class="field grow">
+            <span>API Key</span>
+            <input id="f-key" placeholder="sk-xxxxxxxx…" autocomplete="off" />
+          </label>
+          <button type="submit" class="btn btn-primary" id="key-btn">
+            <span class="spinner hidden"></span><span>查询</span>
+          </button>
+        </div>
+      </form>
+      <div id="key-result" class="key-result hidden"></div>
+    </div>
+  </div>
+
+  <!-- ======================= 确认对话框 ======================= -->
+  <div id="confirm-mask" class="modal-mask hidden" role="alertdialog" aria-modal="true">
+    <div class="modal modal-sm">
+      <div class="modal-head">
+        <h3 id="confirm-title">确认操作</h3>
+      </div>
+      <p class="confirm-body" id="confirm-body"></p>
+      <div class="modal-foot">
+        <button type="button" class="btn btn-ghost" id="confirm-cancel">取消</button>
+        <button type="button" class="btn btn-danger" id="confirm-ok">
+          <span class="spinner hidden"></span><span>确认</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-wrap" class="toast-wrap"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

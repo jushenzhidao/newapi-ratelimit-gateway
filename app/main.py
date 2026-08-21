@@ -4,10 +4,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text, select, func
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
@@ -114,6 +117,23 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# 管理后台跨域：默认允许全部来源（鉴权靠 Bearer Token，无 Cookie，不受 CSRF 影响）。
+# 生产环境可用 ADMIN_CORS_ORIGINS 收紧为具体域名，如 "https://admin.example.com"
+_origins = [o.strip() for o in config.admin.cors_origins.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 静态挂载 ./web 管理后台（必须在 catch-all 代理路由之前注册）
+WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
+if os.path.isdir(WEB_DIR):
+    app.mount("/web", StaticFiles(directory=WEB_DIR, html=True), name="web")
+    logger.info(f"Admin web UI mounted at /web (from {WEB_DIR})")
 
 app.include_router(admin_router)
 

@@ -117,6 +117,8 @@ class AdminConfig(BaseSettings):
 
     enabled: bool = True
     auth_token: str = "change-me-in-production"
+    # 管理后台跨域白名单，逗号分隔；"*" 表示允许任意来源（仅 Bearer Token 鉴权，无 Cookie，风险可控）
+    cors_origins: str = "*"
 
 
 class AppConfig:
