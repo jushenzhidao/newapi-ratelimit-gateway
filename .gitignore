@@ -10,6 +10,7 @@ config.yaml
 
 # ===== 与部署无关的本地内容 =====
 .venv/
+.venv-test/
 .idea/
 .vscode/
 .workbuddy/
